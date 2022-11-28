@@ -3,6 +3,9 @@
 A Rust global memory allocator wrapper which counts allocated and deallocated bytes, avoiding contention between
 threads.
 
+The accounting allocator avoids contention by using per-thread atomic counters. It incurs small one-time global and
+per-thread initialization overhead.
+
 [API Documentation](https://privacyresearchgroup.github.io/accounting-allocator-rs/public/accounting_allocator/)  
 [Private Documentation](https://privacyresearchgroup.github.io/accounting-allocator-rs/private/accounting_allocator/)  
 
