@@ -1,10 +1,17 @@
 [package]
-name    = "accounting-allocator"
+name = "accounting-allocator"
+description = "A global memory allocator wrapper which counts allocated and deallocated bytes."
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
 
 rust-version = "1.61.0"
+
+repository = "https://github.com/privacyresearchgroup/accounting-allocator-rs"
+license = "MIT"
+categories = ["memory-management"]
+keywords = ["allocator", "memory"]
+
+exclude = ["/.github", ".*"]
 
 [dependencies]
 crossbeam-channel = "0.5.6"
