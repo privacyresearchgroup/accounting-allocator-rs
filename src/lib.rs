@@ -9,8 +9,8 @@
 //! static GLOBAL_ALLOCATOR: AccountingAlloc = AccountingAlloc::new();
 //!
 //! fn main() {
-//!     let AllocCounts { alloc, dealloc } = GLOBAL_ALLOCATOR.count();
-//!     println!("alloc {alloc} dealloc {dealloc}");
+//!     let AllocCounts { alloc, dealloc, largest_alloc } = GLOBAL_ALLOCATOR.count();
+//!     println!("alloc {alloc} dealloc {dealloc} largest_alloc {largest_alloc}");
 //! }
 //! ```
 
@@ -20,7 +20,7 @@ use std::fmt;
 use std::fmt::{Debug, Display};
 use std::panic::catch_unwind;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::{AcqRel, Relaxed};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -35,12 +35,14 @@ pub struct AccountingAlloc<A = System> {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-/// A count of allocated and deallocated bytes returned by [`AccountingAlloc::count`].
+/// Statistics for allocations and deallocations made with an [`AccountingAlloc`].
 pub struct AllocCounts {
-    /// Count of allocated bytes.
+    /// Count of all bytes ever allocated with the allocator, globally.
     pub alloc: usize,
-    /// Count of deallocated bytes.
+    /// Count of all bytes ever deallocated with the allocator, globally.
     pub dealloc: usize,
+    /// Largest allocation size in bytes since the last call to [`AccountingAlloc::count`].
+    pub largest_alloc: usize,
 }
 
 #[derive(Debug)]
@@ -60,6 +62,7 @@ struct ThreadCountersShared {
 struct ThreadCounter {
     alloc: AtomicUsize,
     dealloc: AtomicUsize,
+    largest_alloc: AtomicUsize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -84,7 +87,7 @@ impl<A> AccountingAlloc<A> {
         Self { thread_counters: OnceBox::new(), allocator }
     }
 
-    /// Count the number of bytes allocated and deallocated globally.
+    /// Return the latest statistics for this allocator.
     pub fn count(&self) -> AllocCounts {
         let thread_counters = self.thread_counters.get_or_init(Default::default);
         thread_counters.shared.lock().unwrap().count()
@@ -114,13 +117,16 @@ impl<A> AccountingAlloc<A> {
                     let counter = COUNTER.try_with(|counter| Arc::clone(counter))?;
 
                     // Transition to "initialized" state.
+                    let mut largest_alloc = alloc;
                     if let Initializing(init_counter) = STATE.try_with(|state| state.replace(Initialized))? {
                         alloc += init_counter.alloc;
                         dealloc += init_counter.dealloc;
+                        largest_alloc = largest_alloc.max(init_counter.largest_alloc);
                     }
 
                     counter.alloc.fetch_add(alloc, Relaxed);
                     counter.dealloc.fetch_add(dealloc, Relaxed);
+                    counter.largest_alloc.fetch_max(largest_alloc, AcqRel);
 
                     let thread_counters = thread_counters.get_or_init(Default::default);
                     let _ignore = thread_counters.tx.send(counter);
@@ -132,6 +138,7 @@ impl<A> AccountingAlloc<A> {
                     state.set(Initializing(AllocCounts {
                         alloc: init_counts.alloc + alloc,
                         dealloc: init_counts.dealloc + dealloc,
+                        largest_alloc: init_counts.largest_alloc.max(alloc),
                     }))
                 }),
 
@@ -140,6 +147,7 @@ impl<A> AccountingAlloc<A> {
                 Initialized => COUNTER.try_with(|counter| {
                     counter.alloc.fetch_add(alloc, Relaxed);
                     counter.dealloc.fetch_add(dealloc, Relaxed);
+                    counter.largest_alloc.fetch_max(alloc, AcqRel);
                 }),
             }
         });
@@ -161,7 +169,7 @@ impl<A> Display for AccountingAlloc<A> {
         let thread_counters = self.thread_counters.get_or_init(Default::default);
         let mut shared = thread_counters.shared.lock().unwrap();
 
-        let AllocCounts { alloc, dealloc } = shared.count();
+        let AllocCounts { alloc, dealloc, largest_alloc } = shared.count();
 
         for (thread_idx, thread_counter) in shared.counters.iter().enumerate() {
             let thread_alloc = thread_counter.alloc.load(Relaxed);
@@ -169,7 +177,10 @@ impl<A> Display for AccountingAlloc<A> {
             writeln!(f, "Thread {thread_idx}: alloc {thread_alloc} dealloc {thread_dealloc}")?;
         }
         let total = alloc - dealloc;
-        writeln!(f, "Total: {total} (alloc {alloc} dealloc {dealloc})")
+        writeln!(
+            f,
+            "Total: {total} (alloc {alloc} dealloc {dealloc} largest_alloc {largest_alloc})"
+        )
     }
 }
 
@@ -209,16 +220,20 @@ impl ThreadCountersShared {
     fn count(&mut self) -> AllocCounts {
         let mut alloc = 0;
         let mut dealloc = 0;
+        let mut largest_alloc = 0;
+        self.dead.largest_alloc = 0;
 
         self.counters.retain_mut(|counter| match Arc::get_mut(counter) {
             Some(counter) => {
                 self.dead.alloc += *counter.alloc.get_mut();
                 self.dead.dealloc += *counter.dealloc.get_mut();
+                self.dead.largest_alloc = self.dead.largest_alloc.max(*counter.largest_alloc.get_mut());
                 false
             }
             None => {
                 alloc += counter.alloc.load(Relaxed);
                 dealloc += counter.dealloc.load(Relaxed);
+                largest_alloc = largest_alloc.max(counter.largest_alloc.swap(0, AcqRel));
                 true
             }
         });
@@ -228,16 +243,22 @@ impl ThreadCountersShared {
                 Ok(mut counter) => {
                     self.dead.alloc += *counter.alloc.get_mut();
                     self.dead.dealloc += *counter.dealloc.get_mut();
+                    self.dead.largest_alloc = self.dead.largest_alloc.max(*counter.largest_alloc.get_mut());
                 }
                 Err(counter) => {
                     alloc += counter.alloc.load(Relaxed);
                     dealloc += counter.dealloc.load(Relaxed);
+                    largest_alloc = largest_alloc.max(counter.largest_alloc.swap(0, AcqRel));
                     self.counters.push(counter);
                 }
             }
         }
 
-        AllocCounts { alloc: alloc + self.dead.alloc, dealloc: dealloc + self.dead.dealloc }
+        AllocCounts {
+            alloc: alloc + self.dead.alloc,
+            dealloc: dealloc + self.dead.dealloc,
+            largest_alloc: largest_alloc.max(self.dead.largest_alloc),
+        }
     }
 }
 
@@ -270,8 +291,8 @@ mod tests {
         threads.into_iter().for_each(|thread| thread.join().unwrap());
 
         println!("{GLOBAL_ALLOCATOR:?}");
-        let AllocCounts { alloc, dealloc } = GLOBAL_ALLOCATOR.count();
-        println!("Total: alloc {alloc} dealloc {dealloc}");
+        let AllocCounts { alloc, dealloc, largest_alloc } = GLOBAL_ALLOCATOR.count();
+        println!("Total: alloc {alloc} dealloc {dealloc} largest_alloc {largest_alloc}");
         println!("{GLOBAL_ALLOCATOR:?}");
     }
 }
