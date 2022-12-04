@@ -264,35 +264,162 @@ impl ThreadCountersShared {
 
 #[cfg(test)]
 mod tests {
-    use std::thread::spawn;
+    use std::convert::identity;
+
+    use crossbeam_utils::thread::scope;
 
     use super::*;
 
-    #[global_allocator]
-    static GLOBAL_ALLOCATOR: AccountingAlloc = AccountingAlloc::new();
+    #[derive(Default)]
+    struct TestAlloc;
 
-    #[test]
-    fn display() {
-        let threads = (0..9)
-            .map(|idx| spawn(move || drop(Vec::<u8>::with_capacity(10000 * idx))))
-            .collect::<Vec<_>>();
-        threads.into_iter().for_each(|thread| thread.join().unwrap());
+    struct Allocation {
+        layout: Layout,
+    }
 
-        println!("{GLOBAL_ALLOCATOR:?}");
-        println!("{GLOBAL_ALLOCATOR}");
-        println!("{GLOBAL_ALLOCATOR:?}");
+    struct AllocationHandle<'a> {
+        allocator: &'a AccountingAlloc<TestAlloc>,
+        ptr: *mut u8,
+        layout: Layout,
+    }
+
+    fn test_allocations<'a, T>(
+        allocator: &'a AccountingAlloc<TestAlloc>,
+        allocate: fn(&'a AccountingAlloc<TestAlloc>, Layout) -> AllocationHandle<'a>,
+        callback: impl FnOnce(Vec<AllocationHandle<'a>>) -> T,
+    ) -> T {
+        let layouts: Vec<_> = (1..10).map(|idx| Layout::array::<u8>(10000 * idx).unwrap()).collect();
+        let (allocations_tx, allocations_rx) = unbounded();
+        scope(|scope| {
+            for layout in layouts.clone() {
+                let allocations_tx = allocations_tx.clone();
+                scope.spawn(move |_scope| allocations_tx.send(allocate(allocator, layout)).unwrap());
+            }
+            drop(allocations_tx);
+            callback(allocations_rx.into_iter().collect())
+        })
+        .unwrap()
+    }
+
+    fn expected_counts<'a>(allocations: &[AllocationHandle<'a>]) -> AllocCounts {
+        let allocation_sizes = allocations.iter().map(|allocation| allocation.layout.size());
+        AllocCounts {
+            alloc: allocation_sizes.clone().sum::<usize>(),
+            dealloc: 0,
+            largest_alloc: allocation_sizes.max().unwrap(),
+        }
     }
 
     #[test]
-    fn count() {
-        let threads = (0..9)
-            .map(|idx| spawn(move || drop(Vec::<u8>::with_capacity(10000 * idx))))
-            .collect::<Vec<_>>();
-        threads.into_iter().for_each(|thread| thread.join().unwrap());
+    fn alloc() {
+        let allocator = Default::default();
+        let (_allocations, expected) = test_allocations(&allocator, AllocationHandle::new, |allocations| {
+            // test `allocator.count()` while threads are still alive.
+            let expected = expected_counts(&allocations);
+            assert_eq!(allocator.count(), expected);
+            (allocations, expected)
+        });
 
-        println!("{GLOBAL_ALLOCATOR:?}");
-        let AllocCounts { alloc, dealloc, largest_alloc } = GLOBAL_ALLOCATOR.count();
-        println!("Total: alloc {alloc} dealloc {dealloc} largest_alloc {largest_alloc}");
-        println!("{GLOBAL_ALLOCATOR:?}");
+        // test `allocator.count()` again after the threads are dead.
+        assert_eq!(allocator.count(), AllocCounts { largest_alloc: 0, ..expected });
+    }
+
+    #[test]
+    fn dealloc() {
+        let allocator = &Default::default();
+        let allocations = test_allocations(&allocator, AllocationHandle::new, identity);
+        let expected = expected_counts(&allocations);
+
+        assert_eq!(allocator.count(), expected);
+
+        scope(|scope| {
+            for allocation in allocations {
+                scope.spawn(move |_scope| drop(allocation));
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            allocator.count(),
+            AllocCounts { dealloc: expected.alloc, largest_alloc: 0, ..expected }
+        );
+    }
+
+    #[test]
+    fn alloc_zeroed() {
+        let allocator = &Default::default();
+        let allocations = test_allocations(&allocator, AllocationHandle::new_zeroed, identity);
+        let expected = expected_counts(&allocations);
+
+        assert_eq!(allocator.count(), expected);
+    }
+
+    #[test]
+    fn realloc() {
+        let allocator = &Default::default();
+        let mut allocations = test_allocations(&allocator, AllocationHandle::new, identity);
+        let expected = expected_counts(&allocations);
+
+        assert_eq!(allocator.count(), expected);
+
+        scope(|scope| {
+            for allocation in &mut allocations {
+                scope.spawn(move |_scope| allocation.realloc(allocation.layout.size() * 2));
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            allocator.count(),
+            AllocCounts {
+                alloc: expected.alloc * 3,
+                dealloc: expected.alloc,
+                largest_alloc: expected.largest_alloc * 2
+            }
+        );
+    }
+
+    unsafe impl GlobalAlloc for TestAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            Box::into_raw(Box::new(Allocation { layout })) as *mut u8
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            assert_eq!(layout, Box::from_raw(ptr as *mut Allocation).layout);
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            self.alloc(layout)
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            self.dealloc(ptr, layout);
+            self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()))
+        }
+    }
+
+    impl<'a> AllocationHandle<'a> {
+        fn new(allocator: &'a AccountingAlloc<TestAlloc>, layout: Layout) -> Self {
+            Self { allocator, ptr: unsafe { allocator.alloc(layout) }, layout }
+        }
+
+        fn new_zeroed(allocator: &'a AccountingAlloc<TestAlloc>, layout: Layout) -> Self {
+            Self { allocator, ptr: unsafe { allocator.alloc_zeroed(layout) }, layout }
+        }
+
+        fn realloc(&mut self, new_size: usize) {
+            unsafe {
+                self.ptr = self.allocator.realloc(self.ptr, self.layout, new_size);
+                self.layout = Layout::from_size_align_unchecked(new_size, self.layout.align());
+            }
+        }
+    }
+
+    unsafe impl Send for AllocationHandle<'_> {}
+
+    impl Drop for AllocationHandle<'_> {
+        fn drop(&mut self) {
+            unsafe { self.allocator.dealloc(self.ptr, self.layout) };
+        }
     }
 }
