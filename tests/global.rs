@@ -1,4 +1,4 @@
-use accounting_allocator::{AccountingAlloc, AllocCounts};
+use accounting_allocator::{AccountingAlloc, AllTimeAllocStats};
 
 use crossbeam_utils::thread::scope;
 
@@ -21,7 +21,7 @@ fn global_count() {
         .unwrap();
 
     println!("{GLOBAL_ALLOCATOR:?}");
-    let AllocCounts { alloc, dealloc, largest_alloc } = GLOBAL_ALLOCATOR.count();
+    let AllTimeAllocStats { alloc, dealloc, largest_alloc } = GLOBAL_ALLOCATOR.count().all_time;
     println!("Total: alloc {alloc} dealloc {dealloc} largest_alloc {largest_alloc}");
     println!("{GLOBAL_ALLOCATOR:?}");
 }
