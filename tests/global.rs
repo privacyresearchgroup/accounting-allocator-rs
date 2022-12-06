@@ -16,10 +16,23 @@ use crossbeam_utils::thread::scope;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: AccountingAlloc = AccountingAlloc::new();
 
+/// Make some variously sized test allocations in separate threads and return their sizes.
+fn test_allocations() -> Vec<usize> {
+    let vec_sizes: Vec<usize> = (0..9).map(|idx| 10000 * idx).collect();
+
+    scope(|scope| {
+        for vec_size in &vec_sizes {
+            drop(scope.spawn(move |_| drop(Vec::<u8>::with_capacity(*vec_size))))
+        }
+    })
+    .unwrap();
+
+    vec_sizes
+}
+
 #[test]
 fn global_display() {
-    scope(|scope| (0..9).for_each(|idx| drop(scope.spawn(move |_| drop(Vec::<u8>::with_capacity(10000 * idx))))))
-        .unwrap();
+    test_allocations();
 
     println!("{GLOBAL_ALLOCATOR:?}");
     println!("{GLOBAL_ALLOCATOR}");
@@ -28,11 +41,19 @@ fn global_display() {
 
 #[test]
 fn global_count() {
-    scope(|scope| (0..9).for_each(|idx| drop(scope.spawn(move |_| drop(Vec::<u8>::with_capacity(10000 * idx))))))
-        .unwrap();
+    let vec_sizes = test_allocations();
 
     println!("{GLOBAL_ALLOCATOR:?}");
-    let AllTimeAllocStats { alloc, dealloc, largest_alloc } = GLOBAL_ALLOCATOR.count().all_time;
+
+    let stats = GLOBAL_ALLOCATOR.count();
+
+    // Assert that at least the amounts allocated above were counted.
+    assert!(stats.all_time.alloc >= vec_sizes.iter().sum());
+    assert!(stats.all_time.dealloc >= vec_sizes.iter().sum());
+    assert!(stats.all_time.largest_alloc >= *vec_sizes.iter().max().unwrap());
+
+    let AllTimeAllocStats { alloc, dealloc, largest_alloc } = stats.all_time;
     println!("Total: alloc {alloc} dealloc {dealloc} largest_alloc {largest_alloc}");
+
     println!("{GLOBAL_ALLOCATOR:?}");
 }
