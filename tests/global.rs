@@ -1,3 +1,14 @@
+//! Basic functionality tests using `AccountingAlloc` as the global allocator.
+//!
+//! Since it's hard to pin down exactly how much will be allocated using the global allocator in a Rust program, as Rust
+//! is allowed to (and does) allocate whatever it needs using the global allocator internally, the tests in this module
+//! mostly exist to demonstrate that the `Display` and `Debug` impls for `AccountingAlloc` don't hang, infinitely
+//! recurse, panic, or abort.
+//!
+//! On most hosts, there are some implicit assertions in the system allocator for double-free and leak detection. (Plus,
+//! we could probably explicitly add a memory sanitizer on top of that later.) There are also potentially some code
+//! paths which `abort()` inside `AccountingAlloc`, which would indicate bugs.
+
 use accounting_allocator::{AccountingAlloc, AllTimeAllocStats};
 
 use crossbeam_utils::thread::scope;

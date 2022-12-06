@@ -310,18 +310,36 @@ mod tests {
     use super::*;
 
     #[derive(Default)]
+    /// A fake [`GlobalAlloc`] memory allocator for testing, which doesn't actually allocate the memory requested.
+    ///
+    /// This allocator must not actually be registered as the global allocator using `#[global_allocator]`. The pointers
+    /// returned by this allocator should be treated as opaque and only used in subsequent calls to `<TestAlloc as
+    /// GlobalAlloc>` methods.
+    ///
+    /// Though technically panicking from [`GlobalAlloc`] methods is currently considered UB, this is only relevant if
+    /// the [`GlobalAlloc`] is actually registered as the global allocator. Thus, to verify correctness during tests,
+    /// `dealloc` and `realloc` will panic if `layout` is not equal to the `layout` provided to `alloc`.
     struct TestAlloc;
 
+    /// Metadata for an allocation made by [`TestAlloc`].
     struct Allocation {
         layout: Layout,
     }
 
+    /// A handle to an allocation made by an `AccountingAlloc<TestAlloc>`.
+    ///
+    /// The allocation will be deallocated when this structure is dropped.
     struct AllocationHandle<'a> {
         allocator: &'a AccountingAlloc<TestAlloc>,
         ptr: *mut u8,
         layout: Layout,
     }
 
+    /// Make some variously sized test allocations in separate threads using the provided `allocate` function and call
+    /// `callback`.
+    ///
+    /// The `AllocationHandle`s returned by `allocate` are passed to `callback`. After `callback` returns, all spawned
+    /// threads are waited on to terminate, and the return value of `callback` is returned.
     fn test_allocations<'a, T>(
         allocator: &'a AccountingAlloc<TestAlloc>,
         allocate: fn(&'a AccountingAlloc<TestAlloc>, Layout) -> AllocationHandle<'a>,
@@ -340,6 +358,8 @@ mod tests {
         .unwrap()
     }
 
+    /// Calculate the [`AllocStats`] expected from the next call to [`AccountingAlloc::count`] assuming the (only)
+    /// allocations made on the allocator are in `allocations`.
     fn expected_counts<'a>(allocations: &[AllocationHandle<'a>]) -> AllocStats {
         let allocation_sizes = allocations.iter().map(|allocation| allocation.layout.size());
         let since_last = IncrementalAllocStats {
@@ -439,11 +459,18 @@ mod tests {
 
     unsafe impl GlobalAlloc for TestAlloc {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // Since we're not actually accessing this allocated memory in tests, we don't actually need to allocate
+            // anything, but allocating something using the system allocator lets us leverage it for double-free and
+            // leak detection. We save the Layout in a Box, however, to be able to later assert that the Layout upon
+            // dealloc/realloc matches, for correctness verification.
             Box::into_raw(Box::new(Allocation { layout })) as *mut u8
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            assert_eq!(layout, Box::from_raw(ptr as *mut Allocation).layout);
+            // Claim ownership of the allocation and free it.
+            let allocation = Box::from_raw(ptr as *mut Allocation);
+            assert_eq!(layout, allocation.layout);
+            drop(allocation);
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -457,14 +484,17 @@ mod tests {
     }
 
     impl<'a> AllocationHandle<'a> {
+        /// Make a new allocation on `allocator` with the given `layout`.
         fn new(allocator: &'a AccountingAlloc<TestAlloc>, layout: Layout) -> Self {
             Self { allocator, ptr: unsafe { allocator.alloc(layout) }, layout }
         }
 
+        /// Make a new zeroed allocation on `allocator` with the given `layout`.
         fn new_zeroed(allocator: &'a AccountingAlloc<TestAlloc>, layout: Layout) -> Self {
             Self { allocator, ptr: unsafe { allocator.alloc_zeroed(layout) }, layout }
         }
 
+        /// Resize an allocation.
         fn realloc(&mut self, new_size: usize) {
             unsafe {
                 self.ptr = self.allocator.realloc(self.ptr, self.layout, new_size);
